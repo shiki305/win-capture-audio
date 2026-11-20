@@ -2,7 +2,11 @@
 #include <processthreadsapi.h>
 #include <psapi.h>
 
+#include <memory>
+#include <utility>
+
 #include <wil/result_macros.h>
+#include <wil/resource.h>
 #include <winuser.h>
 
 #include "session-monitor.hpp"
@@ -11,6 +15,9 @@ static SessionMonitor *instance = nullptr;
 
 void SessionMonitor::Create()
 {
+	if (instance != nullptr)
+		return;
+
 	instance = new SessionMonitor();
 }
 
@@ -37,30 +44,43 @@ DeviceWatcher::DeviceWatcher(std::wstring device_id, wil::com_ptr<IMMDevice> dev
 
 	THROW_IF_FAILED(manager2->RegisterSessionNotification(&session_notification_client));
 
-	THROW_IF_FAILED(manager2->GetSessionEnumerator(enumerator.put()));
+	// From here on the device forwards session notifications to us, so a failure
+	// has to unregister before propagating or the callback would point at a
+	// destroyed object.
+	try {
+		THROW_IF_FAILED(manager2->GetSessionEnumerator(enumerator.put()));
 
-	int num_sessions = 0;
-	THROW_IF_FAILED(enumerator->GetCount(&num_sessions));
+		int num_sessions = 0;
+		THROW_IF_FAILED(enumerator->GetCount(&num_sessions));
 
-	for (int i = 0; i < num_sessions; ++i) {
-		wil::com_ptr<IAudioSessionControl> session;
-		THROW_IF_FAILED(enumerator->GetSession(i, session.put()));
-		session->AddRef();
+		for (int i = 0; i < num_sessions; ++i) {
+			wil::com_ptr<IAudioSessionControl> session;
+			THROW_IF_FAILED(enumerator->GetSession(i, session.put()));
 
-		AudioSessionState state;
-		THROW_IF_FAILED(session->GetState(&state));
+			AudioSessionState state;
+			THROW_IF_FAILED(session->GetState(&state));
 
-		if (state != AudioSessionStateExpired) {
+			if (state == AudioSessionStateExpired)
+				continue;
+
+			// The message queue takes over this reference; if posting fails
+			// the reference is released here instead of leaking.
 			session->AddRef();
-			PostThreadMessageA(worker_tid, SessionEvents::SessionAdded,
-					   reinterpret_cast<WPARAM>(session.get()), NULL);
+			if (!PostThreadMessageA(worker_tid, SessionEvents::SessionAdded,
+						reinterpret_cast<WPARAM>(session.get()), 0)) {
+				session->Release();
+			}
 		}
+	} catch (...) {
+		manager2->UnregisterSessionNotification(&session_notification_client);
+		throw;
 	}
 }
 
 DeviceWatcher::~DeviceWatcher()
 {
-	manager2->UnregisterSessionNotification(&session_notification_client);
+	if (manager2)
+		manager2->UnregisterSessionNotification(&session_notification_client);
 }
 
 SessionWatcher::SessionWatcher(DWORD worker_tid,
@@ -68,11 +88,16 @@ SessionWatcher::SessionWatcher(DWORD worker_tid,
 	: session_control{session_control}
 {
 	wil::unique_cotaskmem_string session_id_raw;
-	THROW_IF_FAILED(GetSessionControl2()->GetSessionIdentifier(session_id_raw.put()));
+
+	auto session_control2 = GetSessionControl2();
+	if (session_control2 == nullptr)
+		THROW_HR(E_NOINTERFACE);
+
+	THROW_IF_FAILED(session_control2->GetSessionIdentifier(session_id_raw.put()));
 
 	session_id = session_id_raw.get();
 
-	THROW_IF_FAILED(GetSessionControl2()->GetProcessId(&pid));
+	THROW_IF_FAILED(session_control2->GetProcessId(&pid));
 
 	notification_client.emplace(worker_tid, SessionKey(pid, session_id));
 
@@ -89,19 +114,29 @@ SessionWatcher::SessionWatcher(DWORD worker_tid,
 
 	wchar_t name_buf[MAX_PATH] = {'\0'};
 	DWORD length = GetProcessImageFileNameW(session_process.get(), name_buf, MAX_PATH - 1);
+	if (length == 0) {
+		executable = std::string("unknown");
+		return;
+	}
 
 	auto num_chars = WideCharToMultiByte(CP_UTF8, 0, name_buf, -1, NULL, 0, NULL, NULL);
+	if (num_chars <= 1) {
+		executable = std::string("unknown");
+		return;
+	}
+
 	std::string executable_path(num_chars - 1, '\0');
-	WideCharToMultiByte(CP_UTF8, 0, name_buf, -1, &executable_path[0], num_chars, NULL, NULL);
+	WideCharToMultiByte(CP_UTF8, 0, name_buf, -1, executable_path.data(), num_chars, NULL, NULL);
 
 	executable = executable_path.substr(executable_path.find_last_of("\\") + 1);
-	debug("registered new session: [%d] %s", pid, executable.c_str());
+	debug("registered new session: [%lu] %s", pid, executable.c_str());
 }
 
 SessionWatcher::~SessionWatcher()
 {
-	session_control->UnregisterAudioSessionNotification(&notification_client.value());
-	debug("session expired: [%d] %s", pid, executable.c_str());
+	if (session_control && notification_client.has_value())
+		session_control->UnregisterAudioSessionNotification(&notification_client.value());
+	debug("session expired: [%lu] %s", pid, executable.c_str());
 }
 
 void SessionMonitor::Init()
@@ -130,13 +165,15 @@ void SessionMonitor::Init()
 
 void SessionMonitor::UnInit()
 {
-	THROW_IF_FAILED(
-		enumerator->UnregisterEndpointNotificationCallback(&device_notification_client));
+	if (enumerator)
+		enumerator->UnregisterEndpointNotificationCallback(&device_notification_client);
 }
 
 void SessionMonitor::AddDevice(MSG msg)
 {
-	auto id = reinterpret_cast<std::wstring *>(msg.wParam);
+	std::unique_ptr<std::wstring> id{reinterpret_cast<std::wstring *>(msg.wParam)};
+	if (!id)
+		return;
 
 	wil::com_ptr<IMMDevice> device;
 	THROW_IF_FAILED(enumerator->GetDevice(id->c_str(), device.put()));
@@ -147,8 +184,6 @@ void SessionMonitor::AddDevice(MSG msg)
 
 	if (data_flow == eRender)
 		AddDevice(*id, device);
-
-	delete id;
 }
 
 void SessionMonitor::AddDevice(std::wstring id, wil::com_ptr<IMMDevice> device)
@@ -159,9 +194,11 @@ void SessionMonitor::AddDevice(std::wstring id, wil::com_ptr<IMMDevice> device)
 
 void SessionMonitor::RemoveDevice(MSG msg)
 {
-	auto id = reinterpret_cast<std::wstring *>(msg.wParam);
+	std::unique_ptr<std::wstring> id{reinterpret_cast<std::wstring *>(msg.wParam)};
+	if (!id)
+		return;
+
 	RemoveDevice(*id);
-	delete id;
 }
 
 void SessionMonitor::RemoveDevice(std::wstring id)
@@ -176,16 +213,21 @@ void SessionMonitor::RemoveDevice(std::wstring id)
 void SessionMonitor::AddSession(MSG msg)
 {
 	auto session_control_ptr = reinterpret_cast<IAudioSessionControl *>(msg.wParam);
+	if (session_control_ptr == nullptr)
+		return;
 
 	wil::com_ptr<IAudioSessionControl> session_control;
 	*session_control.put() = session_control_ptr;
 
 	auto session_control2 = session_control.query<IAudioSessionControl2>();
+	if (session_control2 == nullptr)
+		return;
+
 	if (session_control2->IsSystemSoundsSession() == S_OK)
 		return;
 
 	std::wstring session_id;
-	DWORD pid;
+	DWORD pid = 0;
 
 	std::string executable;
 
@@ -195,6 +237,10 @@ void SessionMonitor::AddSession(MSG msg)
 
 		session_id = std::wstring(session_id_raw.get());
 		THROW_IF_FAILED(session_control2->GetProcessId(&pid));
+
+		// System sounds and the audio service itself have no usable process.
+		if (pid == 0)
+			return;
 
 		if (session_watchers.contains({pid, session_id}))
 			return;
@@ -206,7 +252,7 @@ void SessionMonitor::AddSession(MSG msg)
 			return;
 
 		executable = it->second.GetExecutable();
-	} catch (wil::ResultException e) {
+	} catch (const wil::ResultException &e) {
 		error("unable to add session: %s", e.what());
 		return;
 	}
@@ -225,18 +271,16 @@ void SessionMonitor::AddSession(MSG msg)
 
 void SessionMonitor::RemoveSession(MSG msg)
 {
-	auto session_key = reinterpret_cast<SessionKey *>(msg.wParam);
-
-	if (!session_watchers.contains(*session_key))
+	std::unique_ptr<SessionKey> session_key{reinterpret_cast<SessionKey *>(msg.wParam)};
+	if (!session_key)
 		return;
 
-	auto &session = session_watchers.at(*session_key);
-
-	auto executable = session.GetExecutable();
-	auto num_removed = session_watchers.erase(*session_key);
-
-	if (num_removed == 0)
+	auto it = session_watchers.find(*session_key);
+	if (it == session_watchers.end())
 		return;
+
+	auto executable = it->second.GetExecutable();
+	session_watchers.erase(it);
 
 	{
 		auto lock = sessions_lock.lock();
@@ -251,23 +295,31 @@ void SessionMonitor::RemoveSession(MSG msg)
 			PostThreadMessageA(client_tid, std::get<1>(msgs), 0, 0);
 	}
 
-	delete session_key;
+	debug("session expired: [%lu] %s", session_key->pid, executable.c_str());
 }
 
 void SessionMonitor::Run()
 {
+	// This thread talks to the Windows audio session APIs, which need COM to be
+	// initialized on the calling thread (CoCreateInstance fails with
+	// CO_E_NOTINITIALIZED otherwise, and the session list comes back empty).
+	auto couninit = wil::CoInitializeEx(COINIT_MULTITHREADED);
+
 	// Force message queue creation
 	MSG msg;
-	PeekMessageA(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+	PeekMessageW(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
 
 	worker_ready.SetEvent();
 	Init();
 
 	bool shutdown = false;
 	while (!shutdown) {
-		if (!GetMessage(&msg, reinterpret_cast<HWND>(-1), WM_USER, 0)) {
-			debug("shutting down");
+		auto result = GetMessageW(&msg, NULL, 0, 0);
+		if (result <= 0) {
+			debug("shutting down (message loop exited with %lld)",
+			      static_cast<long long>(result));
 			shutdown = true;
+			continue;
 		}
 
 		switch (msg.message) {
@@ -291,6 +343,10 @@ void SessionMonitor::Run()
 		case SessionEvents::SessionExpired:
 			RemoveSession(msg);
 			break;
+
+		default:
+			// Thread messages (WM_QUIT, WM_TIMER, ...) we do not care about.
+			break;
 		}
 	}
 
@@ -301,8 +357,12 @@ void SessionMonitor::SafeRun()
 {
 	try {
 		Run();
-	} catch (wil::ResultException e) {
+	} catch (const wil::ResultException &e) {
 		error("%s", e.what());
+	} catch (const std::exception &e) {
+		error("%s", e.what());
+	} catch (...) {
+		error("unknown exception in session monitor thread");
 	}
 }
 
@@ -316,8 +376,15 @@ SessionMonitor::SessionMonitor()
 
 SessionMonitor::~SessionMonitor()
 {
-	worker_ready.wait();
-	PostThreadMessageW(worker_tid, SessionEvents::Shutdown, NULL, NULL);
+	if (!worker_thread.joinable())
+		return;
+
+	// Make sure the worker has created its message queue before posting to it.
+	worker_ready.wait(5000);
+
+	if (worker_tid != 0)
+		PostThreadMessageW(worker_tid, SessionEvents::Shutdown, 0, 0);
+
 	worker_thread.join();
 }
 

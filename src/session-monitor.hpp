@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <atomic>
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
@@ -8,8 +9,11 @@
 #include <thread>
 #include <string>
 #include <memory>
+#include <optional>
+#include <tuple>
 #include <unordered_map>
 #include <set>
+#include <vector>
 
 #include <wil/com.h>
 #include <wrl/implements.h>
@@ -48,37 +52,47 @@ template<> struct hash<SessionKey> {
 class DeviceNotificationClient
 	: public RuntimeClass<RuntimeClassFlags<ClassicCom>, FtmBase, IMMNotificationClient> {
 private:
-	DWORD worker_tid;
+	std::atomic<DWORD> worker_tid{0};
+
+	bool PostDeviceEvent(UINT message, const wchar_t *device_id)
+	{
+		auto tid = worker_tid.load();
+		if (tid == 0 || device_id == nullptr)
+			return false;
+
+		auto id = new std::wstring(device_id);
+		if (!PostThreadMessageA(tid, message, reinterpret_cast<WPARAM>(id), 0)) {
+			delete id;
+			return false;
+		}
+
+		return true;
+	}
 
 public:
-	void SetWorkerThreadId(DWORD tid) { worker_tid = tid; }
+	void SetWorkerThreadId(DWORD tid) { worker_tid.store(tid); }
 
 	STDMETHOD(OnDefaultDeviceChanged)
 	(EDataFlow flow, ERole role, LPCWSTR device_id) { return S_OK; }
 
 	STDMETHOD(OnDeviceAdded)(LPCWSTR device_id)
 	{
-		auto id = new std::wstring(device_id);
-		PostThreadMessageA(worker_tid, SessionEvents::DeviceAdded,
-				   reinterpret_cast<WPARAM>(id), NULL);
+		PostDeviceEvent(SessionEvents::DeviceAdded, device_id);
 		return S_OK;
 	}
 
 	STDMETHOD(OnDeviceRemoved)(LPCWSTR device_id)
 	{
-		auto id = new std::wstring(device_id);
-		PostThreadMessageA(worker_tid, SessionEvents::DeviceRemoved,
-				   reinterpret_cast<WPARAM>(id), NULL);
+		PostDeviceEvent(SessionEvents::DeviceRemoved, device_id);
 		return S_OK;
 	}
 
 	STDMETHOD(OnDeviceStateChanged)(LPCWSTR device_id, DWORD new_state)
 	{
-		auto id = new std::wstring(device_id);
 		UINT code = new_state == DEVICE_STATE_ACTIVE ? SessionEvents::DeviceAdded
 							     : SessionEvents::DeviceRemoved;
 
-		PostThreadMessageA(worker_tid, code, reinterpret_cast<WPARAM>(id), NULL);
+		PostDeviceEvent(code, device_id);
 
 		return S_OK;
 	}
@@ -98,9 +112,14 @@ public:
 
 	STDMETHOD(OnSessionCreated)(IAudioSessionControl *session)
 	{
+		if (session == nullptr)
+			return S_OK;
+
 		session->AddRef();
-		PostThreadMessageA(worker_tid, SessionEvents::SessionAdded,
-				   reinterpret_cast<WPARAM>(session), NULL);
+		if (!PostThreadMessageA(worker_tid, SessionEvents::SessionAdded,
+					reinterpret_cast<WPARAM>(session), 0)) {
+			session->Release();
+		}
 		return S_OK;
 	}
 };
@@ -208,7 +227,7 @@ private:
 	std::unordered_map<SessionKey, std::string> sessions_list;
 
 	std::thread worker_thread;
-	DWORD worker_tid;
+	DWORD worker_tid = 0;
 	wil::unique_event worker_ready{wil::EventOptions::ManualReset};
 
 	DeviceNotificationClient device_notification_client;
@@ -243,6 +262,8 @@ public:
 
 	void RegisterEvent(DWORD client_tid, UINT session_added, UINT session_expired);
 	void UnRegisterEvent(DWORD client_tid);
+
+	bool IsRunning() const { return worker_tid != 0; }
 
 	std::unordered_map<SessionKey, std::string> GetSessions();
 };

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdio>
+#include <atomic>
 #include <optional>
+#include <thread>
 #include <tuple>
 #include <set>
 
@@ -67,19 +69,20 @@ struct AudioCaptureConfig {
 class AudioCapture {
 private:
 	std::thread worker_thread;
-	DWORD worker_tid;
+	std::atomic<DWORD> worker_tid{0};
 	wil::unique_event worker_ready{wil::EventOptions::ManualReset};
 
 	wil::critical_section config_section;
 	AudioCaptureConfig config;
 
-	obs_hotkey_pair_id hotkey_pair;
+	obs_hotkey_pair_id hotkey_pair = OBS_INVALID_HOTKEY_PAIR_ID;
 	obs_source_t *source;
 
 	WAVEFORMATEX format;
 	std::optional<Mixer> mixer;
 
 	std::set<DWORD> pids;
+	int next_session_option_id = 0;
 
 	void StartCapture(const std::set<DWORD> &new_pids);
 	void StopCapture();
@@ -98,7 +101,8 @@ public:
 	void Update(obs_data_t *settings);
 
 	std::tuple<std::string, std::string>
-	MakeSessionOptionStrings(std::set<DWORD> pids, const std::string &executable, bool added);
+	MakeSessionOptionStrings(std::set<DWORD> session_pids, const std::string &executable,
+				 bool added = false);
 
 	void FillActiveSessionList(obs_property_t *session_list, obs_property_t *session_add);
 	std::set<std::string> GetExecutables(obs_data_t *settings);

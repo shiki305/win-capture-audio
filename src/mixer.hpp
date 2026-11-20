@@ -12,10 +12,7 @@
 #include "common.hpp"
 
 namespace MixerEvents {
-enum MixerEvents {
-	Shutdown = WM_USER,
-	Tick,
-};
+enum MixerEvents { Shutdown = WM_USER, Tick };
 }
 
 class Mixer {
@@ -27,20 +24,24 @@ private:
 
 	static const DWORD tick_interval = 10;
 
+	// Upper bound for queued input packets (10 ms each). Without it a stalled
+	// mixer thread could grow the queue until the process runs out of memory.
+	static constexpr size_t max_queued_packets = 200;
+
 	obs_source_t *source;
 
 	std::thread worker_thread;
-	DWORD worker_tid;
+	DWORD worker_tid = 0;
 	wil::unique_event worker_ready{wil::EventOptions::ManualReset};
 
-	HANDLE timer;
+	HANDLE timer = nullptr;
 
 	WAVEFORMATEX format;
 
 	wil::critical_section input_section;
 	std::queue<std::tuple<UINT64, std::vector<float>>> input_queue;
 
-	UINT64 mix_timestamp;
+	UINT64 mix_timestamp = 0;
 	std::vector<float> mix;
 
 	template<typename T> static T RoundToNearest(T x, T m);

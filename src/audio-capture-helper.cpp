@@ -9,6 +9,7 @@
 
 #include <wil/result.h>
 #include <wil/result_macros.h>
+#include <wil/resource.h>
 
 #include "audio-capture-helper.hpp"
 #include "format-conversion.hpp"
@@ -88,9 +89,16 @@ bool AudioCaptureHelper::UnRegisterMixer(Mixer *mixer)
 
 void AudioCaptureHelper::ForwardToMixers(UINT64 qpc_position, BYTE *data, UINT32 num_frames)
 {
-	auto lock = mixers_section.lock();
+	std::vector<Mixer *> targets;
 
-	for (auto *mixer : mixers)
+	{
+		auto lock = mixers_section.lock();
+		targets.assign(mixers.begin(), mixers.end());
+	}
+
+	// Submitting outside the lock keeps a slow mixer from blocking capture
+	// and avoids holding this lock while callbacks run.
+	for (auto *mixer : targets)
 		mixer->SubmitPacket(qpc_position, reinterpret_cast<float *>(data), num_frames);
 }
 
@@ -125,15 +133,39 @@ void AudioCaptureHelper::ForwardPacket()
 
 void AudioCaptureHelper::Capture()
 {
+	// NOTE: the audio client does not exist yet at this point; it is created
+	// by InitCapture() -> InitClient() below, inside this thread. Do not guard
+	// on `client` here.
+
+	// ActivateAudioInterfaceAsync and the audio client require COM on the
+	// calling thread. This has to happen *here*, on the capture thread: the
+	// upstream code initialized COM in the constructor instead, which is the
+	// thread that creates the helper (the source worker), not the thread that
+	// actually calls the audio API. Worse, the paired CoUninitialize then ran
+	// on whatever thread destroyed the helper (possibly OBS's main thread),
+	// tearing down COM that OBS itself depends on.
+	auto couninit = wil::CoInitializeEx(COINIT_MULTITHREADED);
+
 	InitCapture();
 	THROW_IF_FAILED(client->Start());
 
+	// Visible at the default log level, so a normal OBS log shows whether the
+	// process loopback capture actually started (the rest of this file logs at
+	// debug level).
+	info("capture started for pid %lu", pid);
+
 	bool shutdown = false;
 	while (!shutdown) {
-		auto event_id = WaitForMultipleObjects(events.size(), events[0].addressof(), FALSE,
-						       INFINITE);
+		auto event_id = WaitForMultipleObjects(static_cast<DWORD>(events.size()),
+						       events[0].addressof(), FALSE, INFINITE);
 
-		switch (event_id) {
+		if (event_id == WAIT_FAILED || event_id == WAIT_TIMEOUT) {
+			error("wait failed with result: %lu", GetLastError());
+			shutdown = true;
+			break;
+		}
+
+		switch (event_id - WAIT_OBJECT_0) {
 		case HelperEvents::PacketReady:
 			ForwardPacket();
 			break;
@@ -143,7 +175,7 @@ void AudioCaptureHelper::Capture()
 			break;
 
 		default:
-			error("wait failed with result: %d", event_id);
+			error("unexpected wait result: %lu", event_id);
 			shutdown = true;
 			break;
 		}
@@ -156,8 +188,12 @@ void AudioCaptureHelper::CaptureSafe()
 {
 	try {
 		Capture();
-	} catch (wil::ResultException e) {
+	} catch (const wil::ResultException &e) {
 		error("%s", e.what());
+	} catch (const std::exception &e) {
+		error("%s", e.what());
+	} catch (...) {
+		error("unknown exception in capture thread");
 	}
 }
 
@@ -172,10 +208,14 @@ AudioCaptureHelper::AudioCaptureHelper(Mixer *mixer, WAVEFORMATEX format, DWORD 
 
 AudioCaptureHelper::~AudioCaptureHelper()
 {
-	auto lock = mixers_section.lock();
-	mixers.clear();
-	lock.reset();
+	{
+		auto lock = mixers_section.lock();
+		mixers.clear();
+	}
 
-	events[HelperEvents::Shutdown].SetEvent();
-	capture_thread.join();
+	if (events[HelperEvents::Shutdown])
+		events[HelperEvents::Shutdown].SetEvent();
+
+	if (capture_thread.joinable())
+		capture_thread.join();
 }

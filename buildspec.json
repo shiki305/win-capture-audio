@@ -1,0 +1,13 @@
+{
+    "name": "win-capture-audio",
+    "displayName": "Application Audio Capture",
+    "version": "2.4.0",
+    "author": "bozbez and contributors",
+    "website": "https://github.com/bozbez/win-capture-audio",
+    "email": "",
+    "platformConfig": {
+        "macos": {
+            "bundleId": "com.bozbez.win-capture-audio"
+        }
+    }
+}

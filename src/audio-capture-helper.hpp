@@ -54,8 +54,6 @@ enum HelperEvents {
 
 class AudioCaptureHelper {
 private:
-	wil::unique_couninitialize_call couninit{wil::CoInitializeEx()};
-
 	DWORD pid;
 
 	wil::critical_section mixers_section;

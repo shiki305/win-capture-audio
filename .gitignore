@@ -1,16 +1,7 @@
-*~
-.DS_Store
-/build/
-/build32/
-/build64/
-/release/
-/installer/Output/
-
-.vscode
-.idea
-.cache
-
-compile-commands.json
-
-# ignore generated files
-*.generated.*
+build/
+deps/sdk/
+release/
+dist/
+src/plugin-macros.generated.hpp
+*.user
+*.log
